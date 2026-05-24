@@ -1,0 +1,16 @@
+[
+  {
+    "issue_number": 16,
+    "title": "Add a \"Back to Top\" Button to the Footer",
+    "description": "Task - Add a \"Back to Top\" Button to the Footer\nFile: src/components/Footer.tsx\nWhat to do: Add a Back to Top button below the <VisitorCounter />. Clicking it should smoothly scroll the page back to the top.\nSkills practiced: DOM event handler (window.scrollTo), MUI Button, basic sx styling.",
+    "changes": [
+      {
+        "filepath": "src/components/Footer.tsx",
+        "change_type": "edit",
+        "explanation": "Add a centered \"Back to Top\" button after VisitorCounter that calls window.scrollTo with smooth scrolling on click, using the already-imported Button and Box components with variant=\"outlined\" and mt "
+      }
+    ],
+    "pr_url": "https://github.com/fat2fitxpress/fat2fit/pull/21",
+    "created_at": "2026-05-24T21:27:45.747058+00:00"
+  }
+]

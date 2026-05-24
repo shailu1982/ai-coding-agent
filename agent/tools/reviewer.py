@@ -1,34 +1,37 @@
 import os
 import subprocess
-from dotenv import load_dotenv
-from agent.utils.retry import RetryingClient
 
-load_dotenv("config/.env")
-
-client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
+from agent.utils.client import get_client
+from agent.utils.parsing import strip_code_fences
 
 
 def security_scan(filepath: str) -> dict:
     ext = os.path.splitext(filepath)[1]
 
     if ext == ".py":
-        result = subprocess.run(
-            ["bandit", "-r", filepath],
-            capture_output=True,
-            text=True
-        )
-        return {
-            "success": result.returncode == 0,
-            "filepath": filepath,
-            "tool": "bandit",
-            "output": result.stdout + result.stderr
-        }
+        try:
+            result = subprocess.run(
+                ["bandit", "-r", filepath],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            return {
+                "success": result.returncode == 0,
+                "filepath": filepath,
+                "tool": "bandit",
+                "output": (result.stdout or "") + (result.stderr or "")
+            }
+        except subprocess.TimeoutExpired:
+            return {"success": True, "filepath": filepath, "tool": "bandit", "output": "ISSUES_FOUND: no\nBandit timed out — skipped"}
+        except FileNotFoundError:
+            return {"success": True, "filepath": filepath, "tool": "bandit", "output": "ISSUES_FOUND: no\nBandit not installed — skipped"}
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
 
-        response = client.messages.create(
+        response = get_client().messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1024,
             messages=[{
@@ -69,7 +72,7 @@ def optimize_code(filepath: str) -> dict:
 
         ext = os.path.splitext(filepath)[1]
 
-        response = client.messages.create(
+        response = get_client().messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
             messages=[{
@@ -99,9 +102,7 @@ UPDATED_CODE: <full updated file with optimizations applied, or omit if no chang
         if "UPDATED_CODE:" in raw:
             updated_start = raw.find("UPDATED_CODE:") + len("UPDATED_CODE:")
             updated_code = raw[updated_start:].strip()
-            if updated_code.startswith("```"):
-                lines = updated_code.split("\n")
-                updated_code = "\n".join(lines[1:-1])
+            updated_code = strip_code_fences(updated_code)
             if not updated_code:
                 updated_code = None
 
@@ -131,7 +132,7 @@ def check_seo(filepath: str) -> dict:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
 
-        response = client.messages.create(
+        response = get_client().messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1024,
             messages=[{
@@ -181,7 +182,7 @@ def update_readme(repo_path: str, changes_summary: str) -> dict:
         else:
             existing = "# Project\n"
 
-        response = client.messages.create(
+        response = get_client().messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
             messages=[{

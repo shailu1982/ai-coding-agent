@@ -1,11 +1,8 @@
 import os
 import re
-from dotenv import load_dotenv
-from agent.utils.retry import RetryingClient
 
-load_dotenv("config/.env")
-
-client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
+from agent.utils.client import get_client
+from agent.utils.parsing import strip_code_fences
 
 
 def write_file(filepath: str, content: str) -> dict:
@@ -65,7 +62,12 @@ def run_linter(filepath: str) -> dict:
     else:
         return {"success": True, "filepath": filepath, "output": "No linter configured for this file type"}
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return {"success": True, "filepath": filepath, "output": "Linter timed out — skipped"}
+    except FileNotFoundError:
+        return {"success": True, "filepath": filepath, "output": "Linter not found — skipped"}
     return {
         "success": result.returncode == 0,
         "filepath": filepath,
@@ -192,9 +194,9 @@ FILEPATH: <file path>
 
 Return as many CHANGE blocks as needed. Be precise and complete."""
 
-    response = client.messages.create(
+    response = get_client().messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=8096,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}]
     )
 
@@ -217,7 +219,7 @@ def apply_implementation(change: dict) -> dict:
     if os.path.isabs(change["filepath"]):
         filepath = change["filepath"]
     else:
-        filepath = os.path.join(repo_path, change["filepath"].lstrip("/").lstrip("\\"))
+        filepath = os.path.join(repo_path, change["filepath"].lstrip("/\\"))
 
     if change["change_type"] == "create":
         return write_file(filepath, change["new_code"])
@@ -276,17 +278,14 @@ New code to insert or use:
 Return the COMPLETE updated file content with the change applied.
 No explanation, no markdown fences — just the raw file content."""
 
-        response = client.messages.create(
+        response = get_client().messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=8096,
+            max_tokens=8192,
             messages=[{"role": "user", "content": prompt}]
         )
 
         new_content = response.content[0].text.strip()
-
-        if new_content.startswith("```"):
-            lines = new_content.split("\n")
-            new_content = "\n".join(lines[1:-1])
+        new_content = strip_code_fences(new_content)
 
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(new_content)

@@ -1,15 +1,8 @@
 import os
-from github import Github, Auth
-from dotenv import load_dotenv
+import subprocess
+
+from agent.utils.github import get_repo
 from agent.utils.retry import with_github_retry
-
-load_dotenv("config/.env")
-
-
-def get_repo():
-    auth = Auth.Token(os.getenv("GITHUB_TOKEN"))
-    g = Github(auth=auth)
-    return with_github_retry(g.get_repo, os.getenv("GITHUB_REPO"))
 
 
 def validate_base(base_branch: str = "main") -> dict:
@@ -64,7 +57,6 @@ def create_branch(issue_number: int, base_branch: str = "main") -> dict:
 
 
 def checkout(branch_name: str) -> dict:
-    import subprocess
     result = subprocess.run(
         ["git", "checkout", branch_name],
         capture_output=True,

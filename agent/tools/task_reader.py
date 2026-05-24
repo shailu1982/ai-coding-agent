@@ -1,14 +1,9 @@
-import os
-from github import Github, Auth
-from dotenv import load_dotenv
+from agent.utils.github import get_repo
 from agent.utils.retry import with_github_retry
 
-load_dotenv("config/.env")
 
 def get_task(issue_number: int) -> dict:
-    auth = Auth.Token(os.getenv("GITHUB_TOKEN"))
-    g = Github(auth=auth)
-    repo = with_github_retry(g.get_repo, os.getenv("GITHUB_REPO"))
+    repo = get_repo()
     issue = with_github_retry(repo.get_issue, number=issue_number)
 
     return {
@@ -55,6 +50,8 @@ def parse_task(task: dict) -> dict:
         "description": "\n".join(description),
         "acceptance_criteria": criteria
     }
+
+
 def get_criteria(task: dict) -> list:
     return task.get("acceptance_criteria") or []
 

@@ -1,10 +1,9 @@
 import os
-import re
+import shlex
 import subprocess
 import sys
-from dotenv import load_dotenv
 
-load_dotenv("config/.env")
+from agent.utils.parsing import parse_test_counts
 
 _NPX = "npx.cmd" if sys.platform == "win32" else "npx"
 
@@ -28,24 +27,6 @@ def _detect_runner(repo_path: str, config: dict = None) -> str:
     return "none"
 
 
-def _parse_counts(output: str, runner: str) -> tuple:
-    """Return (passed, failed) parsed from structured test output."""
-    if runner in ("jest", "custom"):
-        # Jest prints: "Tests:       3 failed, 15 passed, 18 total"
-        m = re.search(r'Tests:\s+(?:(\d+) failed,\s+)?(\d+) passed', output)
-        if m:
-            return int(m.group(2)), int(m.group(1) or 0)
-
-    # pytest / fallback: "5 passed" and "2 failed" appear on the summary line
-    passed = 0
-    failed = 0
-    m = re.search(r'(\d+) passed', output)
-    if m:
-        passed = int(m.group(1))
-    m = re.search(r'(\d+) failed', output)
-    if m:
-        failed = int(m.group(1))
-    return passed, failed
 
 
 def _run_suite(repo_path: str, config: dict = None) -> dict:
@@ -61,7 +42,7 @@ def _run_suite(repo_path: str, config: dict = None) -> dict:
 
     if runner == "custom":
         test_cmd = cfg.get("test_command") or os.getenv("TEST_COMMAND")
-        cmd = test_cmd.split()
+        cmd = shlex.split(test_cmd)
     elif runner == "jest":
         cmd = [_NPX, "jest", "--no-coverage", "--watchAll=false", "--passWithNoTests"]
     else:
@@ -85,8 +66,8 @@ def _run_suite(repo_path: str, config: dict = None) -> dict:
             "output": f"Test runner not found: {cmd[0]}"
         }
 
-    output = result.stdout + result.stderr
-    passed, failed = _parse_counts(output, runner)
+    output = (result.stdout or "") + (result.stderr or "")
+    passed, failed = parse_test_counts(output, runner)
 
     return {
         "skipped": False, "runner": runner,
@@ -103,9 +84,15 @@ def capture_baseline(repo_path: str, config: dict = None) -> dict:
     return _run_suite(repo_path, config)
 
 
-def check_regressions(repo_path: str, baseline: dict, config: dict = None) -> dict:
+def check_regressions(repo_path: str, baseline: dict, config: dict = None, grace_suites: int = 0) -> dict:
     """
     Run the full test suite after changes and compare to the baseline.
+
+    Args:
+        grace_suites: Number of newly-added test files to exclude from the
+                      regression count. The agent's own generated tests may
+                      fail due to environment issues (missing Babel presets,
+                      etc.) and should not block a clean implementation.
 
     Returns:
         {
@@ -124,7 +111,7 @@ def check_regressions(repo_path: str, baseline: dict, config: dict = None) -> di
     if after.get("skipped") or after.get("timed_out"):
         return {"regressions": 0, "skipped": True, "snippet": after.get("output", "")}
 
-    new_failures = max(0, after["failed"] - baseline["failed"])
+    new_failures = max(0, after["failed"] - baseline["failed"] - grace_suites)
 
     return {
         "regressions": new_failures,

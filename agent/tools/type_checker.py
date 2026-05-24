@@ -20,7 +20,8 @@ def detect_type_checker(repo_path: str) -> str:
         if os.path.exists(path):
             try:
                 with open(path, encoding="utf-8", errors="ignore") as fh:
-                    if "[mypy]" in fh.read() or "mypy" in fh.read():
+                    content = fh.read()
+                    if "[mypy]" in content or "mypy" in content:
                         return "mypy"
             except OSError:
                 pass

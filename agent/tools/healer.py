@@ -1,10 +1,7 @@
 import os
-from dotenv import load_dotenv
-from agent.utils.retry import RetryingClient
 
-load_dotenv("config/.env")
-
-client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
+from agent.utils.client import get_client
+from agent.utils.parsing import strip_code_fences
 
 _RUNNER_ERRORS = [
     "command not found",
@@ -82,9 +79,9 @@ EXPLANATION: <one sentence describing the root cause and what you changed>
 FIXED_CODE:
 <complete corrected file content, no markdown fences>"""
 
-    response = client.messages.create(
+    response = get_client().messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=8096,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}]
     )
 
@@ -103,9 +100,7 @@ FIXED_CODE:
     if "FIXED_CODE:" in raw:
         code_start = raw.find("FIXED_CODE:") + len("FIXED_CODE:")
         fixed_code = raw[code_start:].strip()
-        if fixed_code.startswith("```"):
-            lines = fixed_code.split("\n")
-            fixed_code = "\n".join(lines[1:-1])
+        fixed_code = strip_code_fences(fixed_code)
 
     if not fixed_code:
         return {"success": False, "error": "Healer returned no fixed code"}

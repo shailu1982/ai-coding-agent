@@ -1,8 +1,5 @@
 import os
 from pathlib import Path
-from dotenv import load_dotenv
-
-load_dotenv("config/.env")
 
 INCLUDE_EXTENSIONS = [
     ".ts", ".tsx", ".js", ".jsx",

@@ -1,18 +1,9 @@
 import os
 import subprocess
-from github import Github, Auth
-from dotenv import load_dotenv
-from agent.utils.retry import RetryingClient, with_github_retry
 
-load_dotenv("config/.env")
-
-client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-
-def get_repo():
-    auth = Auth.Token(os.getenv("GITHUB_TOKEN"))
-    g = Github(auth=auth)
-    return g.get_repo(os.getenv("GITHUB_REPO"))
+from agent.utils.client import get_client
+from agent.utils.github import get_repo
+from agent.utils.retry import with_github_retry
 
 
 def run_git(args: list, cwd: str) -> dict:
@@ -88,7 +79,7 @@ def push_branch(branch_name: str) -> dict:
 def generate_pr_description(task: dict, changes: list) -> str:
     changes_text = "\n".join(f"- {c}" for c in changes)
 
-    response = client.messages.create(
+    response = get_client().messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
         messages=[{
@@ -180,7 +171,7 @@ def create_pull_request(
 def generate_commit_message(task: dict, changes: list) -> str:
     changes_text = "\n".join(f"- {c}" for c in changes)
 
-    response = client.messages.create(
+    response = get_client().messages.create(
         model="claude-sonnet-4-6",
         max_tokens=256,
         messages=[{

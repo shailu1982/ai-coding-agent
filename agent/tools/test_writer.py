@@ -1,12 +1,9 @@
 import os
 import sys
 import subprocess
-from dotenv import load_dotenv
-from agent.utils.retry import RetryingClient
 
-load_dotenv("config/.env")
-
-client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
+from agent.utils.client import get_client
+from agent.utils.parsing import strip_code_fences, parse_test_counts
 
 _NPX = "npx.cmd" if sys.platform == "win32" else "npx"
 
@@ -61,8 +58,10 @@ def run_tests(test_path: str) -> dict:
         }
 
     output = result.stdout + result.stderr
-    passed_count = output.count("✓") + output.count("√") + output.count("PASS") + output.count("passed")
-    failed_count = output.count("✗") + output.count("×") + output.count("FAIL") + output.count("failed")
+
+    ext = os.path.splitext(test_path)[1]
+    runner = "pytest" if ext == ".py" else "jest"
+    passed_count, failed_count = parse_test_counts(output, runner)
 
     return {
         "success": result.returncode == 0,
@@ -161,17 +160,14 @@ Write comprehensive tests for the following task.
 
 Return ONLY the raw test file content — no explanation, no markdown fences."""
 
-    response = client.messages.create(
+    response = get_client().messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}]
     )
 
     raw = response.content[0].text.strip()
-
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        raw = "\n".join(lines[1:-1])
+    raw = strip_code_fences(raw)
 
     return raw
 

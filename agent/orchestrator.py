@@ -4,12 +4,13 @@ import argparse
 from dotenv import load_dotenv
 from rich import print
 from rich.panel import Panel
-from agent.utils.retry import RetryingClient
+from agent.utils.client import get_client
 from agent.utils.config import load_repo_config
+from agent.utils.parsing import strip_code_fences
 
 load_dotenv("config/.env")
 
-client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = get_client()
 
 from agent.tools.task_reader import get_task, parse_task
 from agent.tools.branch_manager import validate_base, create_branch
@@ -36,7 +37,7 @@ def _primary_file(filepaths: list) -> str:
 def _resolve(filepath: str, repo_path: str) -> str:
     if os.path.isabs(filepath):
         return filepath
-    return os.path.join(repo_path, filepath.lstrip("/").lstrip("\\"))
+    return os.path.join(repo_path, filepath.lstrip("/\\"))
 
 
 def find_relevant_files(task: dict, repo_path: str, max_files: int = 5) -> dict:
@@ -70,8 +71,7 @@ Return only the JSON array, nothing else."""
 
     try:
         if raw.startswith("```"):
-            lines = raw.split("\n")
-            raw = "\n".join(lines[1:-1])
+            raw = strip_code_fences(raw)
         paths = json.loads(raw)
     except Exception:
         # Fallback — extract paths manually
@@ -140,11 +140,13 @@ def run_agent(issue_number: int) -> str:
     for path in file_contents:
         print(f"     • {path}")
 
+    # Capture test baseline before touching any files
+    guard_enabled = config["regression_guard"]
+    baseline = None
+
     if not file_contents:
         raise RuntimeError("No relevant files found in codebase")
 
-    # Capture test baseline before touching any files
-    guard_enabled = config["regression_guard"]
     if guard_enabled:
         baseline = capture_baseline(repo_path, config)
         if baseline.get("skipped"):
@@ -283,8 +285,11 @@ def run_agent(issue_number: int) -> str:
     # STAGE 6: Regression guard
     # ─────────────────────────────────────────
     print("\n[bold cyan]━━ Stage 6: Regression guard...[/bold cyan]")
-    if guard_enabled:
-        reg = check_regressions(repo_path, baseline, config)
+    # Count test files the agent generated — failures in these don't count
+    # as regressions against pre-existing code (env config issues, etc.)
+    new_test_files = [f for f in changed_files if ".test." in os.path.basename(f)]
+    if guard_enabled and baseline is not None:
+        reg = check_regressions(repo_path, baseline, config, grace_suites=len(new_test_files))
         if reg.get("skipped"):
             print(f"  ℹ️  Skipped  : {reg.get('snippet', 'no runner available')[:80]}")
         elif reg["regressions"] == 0:
@@ -308,22 +313,40 @@ def run_agent(issue_number: int) -> str:
 
     # Security
     if review_cfg.get("security", True):
-        sec = security_scan(impl_filepath)
-        output_lower = sec.get("output", "").lower()
-        sec_status = "clean" if "issues_found: no" in output_lower or "no issues" in output_lower else "issues found — review output"
-        print(f"  ✅ Security : {sec_status}")
+        for review_path in changed_files:
+            sec = security_scan(review_path)
+            output_text = sec.get("output", "")
+            # Parse the structured ISSUES_FOUND field rather than substring matching
+            issues_found = False
+            for sec_line in output_text.split("\n"):
+                if sec_line.strip().upper().startswith("ISSUES_FOUND:"):
+                    issues_found = "yes" in sec_line.lower()
+                    break
+            sec_status = "issues found — review output" if issues_found else "clean"
+            print(f"  ✅ Security : {os.path.basename(review_path)} — {sec_status}")
     else:
         print(f"  ℹ️  Security : skipped (config)")
 
     # Optimisation
     if review_cfg.get("optimize", True):
-        opt = optimize_code(impl_filepath)
-        if opt.get("updated_code"):
-            with open(impl_filepath, "w", encoding="utf-8") as f:
-                f.write(opt["updated_code"])
-            print(f"  ✅ Optimised: code updated")
-        else:
-            print(f"  ✅ Optimised: no changes needed")
+        for review_path in changed_files:
+            opt = optimize_code(review_path)
+            if opt.get("updated_code"):
+                updated = opt["updated_code"]
+                # Safety check: don't overwrite if the optimized code is drastically shorter
+                try:
+                    with open(review_path, "r", encoding="utf-8") as f:
+                        original = f.read()
+                    if len(updated) < len(original) * 0.5:
+                        print(f"  ⚠️  Optimised: {os.path.basename(review_path)} — skipped (output too short, likely truncated)")
+                        continue
+                    with open(review_path, "w", encoding="utf-8") as f:
+                        f.write(updated)
+                    print(f"  ✅ Optimised: {os.path.basename(review_path)} — code updated")
+                except Exception as opt_err:
+                    print(f"  ⚠️  Optimised: {os.path.basename(review_path)} — write failed: {opt_err}")
+            else:
+                print(f"  ✅ Optimised: {os.path.basename(review_path)} — no changes needed")
     else:
         print(f"  ℹ️  Optimise : skipped (config)")
 

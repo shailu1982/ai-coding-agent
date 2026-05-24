@@ -1,27 +1,14 @@
 import os
-from github import Github, Auth, GithubException
 from dotenv import load_dotenv
 from rich import print
 from rich.panel import Panel
+from agent.utils.github import get_repo, ensure_label, process_issue_success, process_issue_failure
 from agent.utils.retry import with_github_retry
 from agent.utils.config import load_repo_config
 from agent.utils.summary import write_run_header, write_issue_success, write_issue_failure, write_no_work
 from agent.utils.notifications import notify_success, notify_failure
 
 load_dotenv("config/.env")
-
-_LABEL_COLORS = {
-    "ai-processing": "fbca04",
-    "ai-done":       "0e8a16",
-    "ai-failed":     "d73a4a",
-}
-
-
-def _ensure_label(repo, name: str):
-    try:
-        with_github_retry(repo.get_label, name)
-    except GithubException:
-        with_github_retry(repo.create_label, name, _LABEL_COLORS.get(name, "ededed"))
 
 
 def _get_pending(repo, trigger_label: str, skip_labels: set):
@@ -44,12 +31,14 @@ def run():
     done_label       = labels["done"]
     failed_label     = labels["failed"]
 
-    auth = Auth.Token(os.getenv("GITHUB_TOKEN"))
-    g = Github(auth=auth)
-    repo = with_github_retry(g.get_repo, os.getenv("GITHUB_REPO"))
+    auth_token = os.getenv("GITHUB_TOKEN")
+    if not auth_token:
+        raise RuntimeError("GITHUB_TOKEN is not set")
+
+    repo = get_repo()
 
     for label in (processing_label, done_label, failed_label):
-        _ensure_label(repo, label)
+        ensure_label(repo, label)
 
     skip_labels = {processing_label, done_label, failed_label}
     pending = _get_pending(repo, trigger_label, skip_labels)
@@ -73,14 +62,7 @@ def run():
         try:
             pr_url = run_agent(issue.number)
 
-            with_github_retry(issue.remove_from_labels, trigger_label)
-            with_github_retry(issue.remove_from_labels, processing_label)
-            with_github_retry(issue.add_to_labels, done_label)
-            with_github_retry(
-                issue.create_comment,
-                f"✅ **AI Agent completed this task automatically.**\n\n"
-                f"Pull request: {pr_url}",
-            )
+            process_issue_success(issue, labels, pr_url)
             write_issue_success(issue.number, issue.title, pr_url)
             try:
                 notify_success(issue.number, issue.title, pr_url, config)
@@ -89,14 +71,7 @@ def run():
             print(f"  [green]✅ Done — {pr_url}[/green]")
 
         except Exception as exc:
-            with_github_retry(issue.remove_from_labels, processing_label)
-            with_github_retry(issue.add_to_labels, failed_label)
-            with_github_retry(
-                issue.create_comment,
-                f"❌ **AI Agent failed to complete this task.**\n\n"
-                f"```\n{exc}\n```\n\n"
-                f"Remove the `{failed_label}` label and re-add `{trigger_label}` to retry.",
-            )
+            process_issue_failure(issue, labels, exc)
             write_issue_failure(issue.number, issue.title, exc)
             try:
                 notify_failure(issue.number, issue.title, exc, config)
