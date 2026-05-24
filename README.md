@@ -7,7 +7,7 @@ An autonomous AI agent that watches your GitHub issues and implements them end-t
 ```
 You label an issue "ai-implement"
         ↓
-GitHub Actions runs every 10 minutes
+You manually trigger the workflow from the Actions tab
         ↓
 Discover job finds pending issues, claims them with "ai-processing"
         ↓
@@ -93,7 +93,7 @@ Go to `Settings → Secrets and variables → Actions` in this repo and add:
 
 ### 4. Enable GitHub Actions
 
-Push this repo to GitHub. The workflow at `.github/workflows/agent.yml` will start running on its 10-minute schedule automatically. You can also trigger it manually from the Actions tab.
+Push this repo to GitHub. The workflow at `.github/workflows/agent.yml` is configured to be triggered manually. You can trigger it from the Actions tab whenever you have issues ready.
 
 ### 5. Verify the connection (optional, local only)
 
@@ -160,9 +160,7 @@ notifications:
 1. Go to your **target repo** and create a new issue
 2. Write a clear description with **Acceptance Criteria** as a checklist
 3. Add the label **`ai-implement`** to the issue
-4. The agent picks it up within 10 minutes, runs the pipeline, and comments with the PR link
-
-To trigger immediately without waiting, go to `Actions → AI Coding Agent → Run workflow`.
+4. Trigger the workflow manually from `Actions → AI Coding Agent → Run workflow` in this repository
 
 ### Running manually (local)
 
@@ -180,7 +178,7 @@ python agent/daemon.py
 ai-coding-agent/
 ├── .github/
 │   └── workflows/
-│       └── agent.yml              # Scheduled GitHub Actions workflow
+│       └── agent.yml              # GitHub Actions workflow (manual trigger)
 ├── agent/
 │   ├── orchestrator.py            # 8-stage pipeline logic
 │   ├── daemon.py                  # Sequential issue processor (local/fallback)
@@ -217,7 +215,7 @@ ai-coding-agent/
 ## Tech Stack
 
 - **AI:** Anthropic SDK — Claude Sonnet 4.6
-- **Automation:** GitHub Actions (scheduled cron + dynamic matrix)
+- **Automation:** GitHub Actions (manual workflow_dispatch + dynamic matrix)
 - **GitHub API:** PyGithub with retry/backoff
 - **Resilience:** Exponential backoff for Anthropic & GitHub APIs, self-healing test loop
 - **Terminal UI:** Rich
@@ -228,7 +226,7 @@ ai-coding-agent/
 
 ```
 ┌─────────────────────────────────────────────┐
-│             GitHub Actions (cron)            │
+│             GitHub Actions (manual)          │
 │                                             │
 │  ┌──────────┐    ┌──────────┐ ┌──────────┐  │
 │  │ discover │───→│ worker 1 │ │ worker 2 │  │

@@ -1,8 +1,8 @@
 name: AI Coding Agent
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'  # every 10 minutes
+  # schedule:
+  #   - cron: '*/10 * * * *'  # every 10 minutes
   workflow_dispatch:          # allow manual trigger from the Actions UI
 
 concurrency:
