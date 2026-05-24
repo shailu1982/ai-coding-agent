@@ -1,11 +1,11 @@
 import os
 import subprocess
-import anthropic
 from dotenv import load_dotenv
+from agent.utils.retry import RetryingClient
 
 load_dotenv("config/.env")
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 
 def security_scan(filepath: str) -> dict:
@@ -24,7 +24,6 @@ def security_scan(filepath: str) -> dict:
             "output": result.stdout + result.stderr
         }
 
-    # For JS/TS files use Claude to scan
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
@@ -35,8 +34,8 @@ def security_scan(filepath: str) -> dict:
             messages=[{
                 "role": "user",
                 "content": f"""Review this code for security vulnerabilities only.
-Look for: XSS, injection, exposed secrets, insecure dependencies,
-unsafe data handling, missing input validation.
+Look for: XSS, injection attacks, exposed secrets or tokens, insecure data handling,
+missing input validation, unsafe use of eval or exec, and insecure dependencies.
 
 File: {filepath}
 Code:
@@ -52,20 +51,15 @@ RECOMMENDATION: one line fix suggestion"""
             }]
         )
 
-        raw = response.content[0].text
         return {
             "success": True,
             "filepath": filepath,
             "tool": "claude",
-            "output": raw
+            "output": response.content[0].text
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "filepath": filepath,
-            "error": str(e)
-        }
+        return {"success": False, "filepath": filepath, "error": str(e)}
 
 
 def optimize_code(filepath: str) -> dict:
@@ -73,14 +67,18 @@ def optimize_code(filepath: str) -> dict:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
 
+        ext = os.path.splitext(filepath)[1]
+
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
             messages=[{
                 "role": "user",
                 "content": f"""Review this code for performance and quality improvements only.
-Look for: unnecessary re-renders, missing memoization, redundant code,
-inefficient loops, large bundle imports, accessibility issues.
+Look for: redundant computations, inefficient loops, unnecessary object or array creation,
+oversized imports that could be tree-shaken or lazy-loaded, dead code, missing error
+handling at I/O boundaries, and readability issues that increase maintenance cost.
+File extension: {ext}
 
 File: {filepath}
 Code:
@@ -91,20 +89,21 @@ OPTIMIZATIONS_FOUND: yes or no
 OPTIMIZATIONS:
 - optimization 1
 - optimization 2
-UPDATED_CODE: <full updated file with optimizations applied>"""
+UPDATED_CODE: <full updated file with optimizations applied, or omit if no changes needed>"""
             }]
         )
 
         raw = response.content[0].text
-
-        # Extract updated code if provided
         updated_code = None
+
         if "UPDATED_CODE:" in raw:
             updated_start = raw.find("UPDATED_CODE:") + len("UPDATED_CODE:")
             updated_code = raw[updated_start:].strip()
             if updated_code.startswith("```"):
                 lines = updated_code.split("\n")
                 updated_code = "\n".join(lines[1:-1])
+            if not updated_code:
+                updated_code = None
 
         return {
             "success": True,
@@ -114,35 +113,33 @@ UPDATED_CODE: <full updated file with optimizations applied>"""
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "filepath": filepath,
-            "error": str(e)
-        }
+        return {"success": False, "filepath": filepath, "error": str(e)}
 
 
 def check_seo(filepath: str) -> dict:
+    ext = os.path.splitext(filepath)[1]
+
+    if ext not in (".tsx", ".jsx", ".html"):
+        return {
+            "success": True,
+            "filepath": filepath,
+            "output": "SEO check skipped — not a UI file",
+            "issues": []
+        }
+
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
-
-        ext = os.path.splitext(filepath)[1]
-        if ext not in [".tsx", ".jsx", ".html"]:
-            return {
-                "success": True,
-                "filepath": filepath,
-                "output": "SEO check skipped — not a UI file",
-                "issues": []
-            }
 
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1024,
             messages=[{
                 "role": "user",
-                "content": f"""Review this React/HTML file for SEO and accessibility issues only.
+                "content": f"""Review this file for SEO and accessibility issues only.
 Look for: missing alt tags, missing aria labels, missing semantic HTML,
-missing meta tags, poor heading hierarchy, missing title attributes.
+missing meta tags, poor heading hierarchy, missing title attributes,
+and keyboard navigation problems.
 
 File: {filepath}
 Code:
@@ -158,10 +155,10 @@ RECOMMENDATION: one line fix suggestion"""
         )
 
         raw = response.content[0].text
-        issues = []
-        for line in raw.split("\n"):
-            if line.strip().startswith("- "):
-                issues.append(line.strip()[2:])
+        issues = [
+            line.strip()[2:] for line in raw.split("\n")
+            if line.strip().startswith("- ")
+        ]
 
         return {
             "success": True,
@@ -171,11 +168,7 @@ RECOMMENDATION: one line fix suggestion"""
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "filepath": filepath,
-            "error": str(e)
-        }
+        return {"success": False, "filepath": filepath, "error": str(e)}
 
 
 def update_readme(repo_path: str, changes_summary: str) -> dict:
@@ -195,7 +188,7 @@ def update_readme(repo_path: str, changes_summary: str) -> dict:
                 "role": "user",
                 "content": f"""Update this README.md to reflect the following changes.
 Only update relevant sections. Do not rewrite the whole README.
-If a changelog or recent changes section exists update it.
+If a changelog or recent changes section exists, update it.
 If not, add a small ## Recent Changes section at the bottom.
 
 Current README:
@@ -214,46 +207,30 @@ No explanation, no markdown fences."""
         with open(readme_path, "w", encoding="utf-8") as f:
             f.write(updated)
 
-        return {
-            "success": True,
-            "filepath": readme_path,
-            "message": "README updated successfully"
-        }
+        return {"success": True, "filepath": readme_path}
 
     except Exception as e:
-        return {
-            "success": False,
-            "filepath": readme_path,
-            "error": str(e)
-        }
+        return {"success": False, "filepath": readme_path, "error": str(e)}
 
 
-# Quick test
 if __name__ == "__main__":
+    import argparse
     from rich import print
 
-    repo_path = os.getenv("REPO_LOCAL_PATH", ".")
-    target_file = os.path.join(
-        repo_path, "src", "components", "SearchBar.tsx"
-    )
+    parser = argparse.ArgumentParser(description="Run review checks on a file")
+    parser.add_argument("--file", required=True, help="File to review")
+    args = parser.parse_args()
 
-    print("\n[bold]Step 1: Security scan...[/bold]")
-    sec = security_scan(target_file)
-    print(sec["output"][:300])
+    print(f"\n[bold cyan]Security scan:[/bold cyan]")
+    sec = security_scan(args.file)
+    print(sec["output"][:400])
 
-    print("\n[bold]Step 2: Code optimisation...[/bold]")
-    opt = optimize_code(target_file)
-    print(opt["output"][:300])
+    print(f"\n[bold cyan]Optimization check:[/bold cyan]")
+    opt = optimize_code(args.file)
+    print(opt["output"][:400])
 
-    print("\n[bold]Step 3: SEO check...[/bold]")
-    seo = check_seo(target_file)
-    print(f"Issues found: {len(seo['issues'])}")
-    for issue in seo["issues"]:
+    print(f"\n[bold cyan]SEO / accessibility check:[/bold cyan]")
+    seo = check_seo(args.file)
+    print(f"Issues found: {len(seo.get('issues', []))}")
+    for issue in seo.get("issues", []):
         print(f"  • {issue}")
-
-    print("\n[bold]Step 4: Updating README...[/bold]")
-    result = update_readme(
-        repo_path,
-        "Added result count label to SearchBar component showing number of search results"
-    )
-    print(result)

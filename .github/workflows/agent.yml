@@ -1,0 +1,115 @@
+name: AI Coding Agent
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'  # every 10 minutes
+  workflow_dispatch:          # allow manual trigger from the Actions UI
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1: discover
+#   Finds all pending issues, claims them with 'processing' label, and outputs
+#   a JSON matrix so each issue is handled in its own parallel job.
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.find-issues.outputs.matrix }}
+
+    steps:
+      - name: Checkout agent repo
+        uses: actions/checkout@v4
+        with:
+          path: agent-code
+
+      - name: Checkout target repo (for .agent.yml config)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          path: target-repo
+          sparse-checkout: .agent.yml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: agent-code/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r agent-code/requirements.txt
+
+      - name: Find pending issues
+        id: find-issues
+        working-directory: agent-code
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ secrets.TARGET_REPO }}
+          REPO_LOCAL_PATH: ${{ github.workspace }}/target-repo
+          BASE_BRANCH: ${{ vars.BASE_BRANCH || 'main' }}
+        run: echo "matrix=$(python agent/discover.py)" >> $GITHUB_OUTPUT
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2: process  (one job per issue, runs in parallel)
+#   Each matrix job gets a fresh checkout of the target repo and runs the
+#   full agent pipeline for its assigned issue number.
+# ─────────────────────────────────────────────────────────────────────────────
+  process:
+    needs: discover
+    if: ${{ needs.discover.outputs.matrix != '[]' && needs.discover.outputs.matrix != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        issue: ${{ fromJson(needs.discover.outputs.matrix) }}
+      fail-fast: false   # one issue failing must not cancel other parallel jobs
+
+    steps:
+      - name: Checkout agent repo
+        uses: actions/checkout@v4
+        with:
+          path: agent-code
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          path: target-repo
+
+      - name: Configure git identity
+        run: |
+          git -C target-repo config user.name "AI Coding Agent"
+          git -C target-repo config user.email "ai-agent@users.noreply.github.com"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: agent-code/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r agent-code/requirements.txt
+
+      - name: Process issue ${{ matrix.issue }}
+        working-directory: agent-code
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ secrets.TARGET_REPO }}
+          REPO_LOCAL_PATH: ${{ github.workspace }}/target-repo
+          BASE_BRANCH: ${{ vars.BASE_BRANCH || 'main' }}
+          MAX_HEAL_ATTEMPTS: ${{ vars.MAX_HEAL_ATTEMPTS || '3' }}
+          REGRESSION_GUARD: ${{ vars.REGRESSION_GUARD || 'true' }}
+          TEST_COMMAND: ${{ vars.TEST_COMMAND || '' }}
+          TEST_SUITE_TIMEOUT: ${{ vars.TEST_SUITE_TIMEOUT || '300' }}
+          MAX_API_RETRIES: ${{ vars.MAX_API_RETRIES || '3' }}
+          API_RETRY_DELAY: ${{ vars.API_RETRY_DELAY || '2.0' }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python agent/worker.py --issue ${{ matrix.issue }}

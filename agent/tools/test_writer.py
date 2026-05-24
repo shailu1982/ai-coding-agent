@@ -1,37 +1,51 @@
 import os
+import sys
 import subprocess
-import anthropic
 from dotenv import load_dotenv
+from agent.utils.retry import RetryingClient
 
 load_dotenv("config/.env")
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+_NPX = "npx.cmd" if sys.platform == "win32" else "npx"
+
+
+def _detect_framework(file_contents: dict) -> str:
+    """Return 'react', 'jest', 'pytest', or 'generic' based on file extensions."""
+    for filepath in file_contents:
+        ext = os.path.splitext(filepath)[1]
+        if ext in (".tsx", ".jsx"):
+            return "react"
+        if ext in (".ts", ".js"):
+            return "jest"
+        if ext == ".py":
+            return "pytest"
+    return "generic"
 
 
 def write_test_file(filepath: str, content: str) -> dict:
     try:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
-        return {
-            "success": True,
-            "filepath": filepath,
-            "message": f"Test file written successfully"
-        }
+        return {"success": True, "filepath": filepath}
     except Exception as e:
-        return {
-            "success": False,
-            "filepath": filepath,
-            "error": str(e)
-        }
+        return {"success": False, "filepath": filepath, "error": str(e)}
 
 
 def run_tests(test_path: str) -> dict:
     repo_path = os.getenv("REPO_LOCAL_PATH", ".")
+    ext = os.path.splitext(test_path)[1]
+
+    if ext == ".py":
+        cmd = [sys.executable, "-m", "pytest", test_path, "-v"]
+    else:
+        cmd = [_NPX, "jest", test_path, "--no-coverage", "--watchAll=false"]
 
     try:
         result = subprocess.run(
-            ["npx.cmd", "jest", test_path, "--no-coverage", "--watchAll=false"],
+            cmd,
             capture_output=True,
             text=True,
             cwd=repo_path,
@@ -46,15 +60,12 @@ def run_tests(test_path: str) -> dict:
             "output": "Tests timed out after 60 seconds"
         }
 
-    passed = result.returncode == 0
     output = result.stdout + result.stderr
-
-    # Count passed and failed
-    passed_count = output.count("✓") + output.count("√") + output.count("PASS")
-    failed_count = output.count("✗") + output.count("×") + output.count("FAIL")
+    passed_count = output.count("✓") + output.count("√") + output.count("PASS") + output.count("passed")
+    failed_count = output.count("✗") + output.count("×") + output.count("FAIL") + output.count("failed")
 
     return {
-        "success": passed,
+        "success": result.returncode == 0,
         "test_path": test_path,
         "passed_count": passed_count,
         "failed_count": failed_count,
@@ -66,28 +77,22 @@ def get_coverage(module_path: str) -> dict:
     repo_path = os.getenv("REPO_LOCAL_PATH", ".")
 
     result = subprocess.run(
-        [
-            "npx.cmd", "jest",
-            module_path,
-            "--coverage",
-            "--watchAll=false",
-            "--coverageReporters=text"
-        ],
+        [_NPX, "jest", module_path, "--coverage", "--watchAll=false", "--coverageReporters=text"],
         capture_output=True,
         text=True,
         cwd=repo_path
     )
 
     output = result.stdout + result.stderr
-
-    # Extract coverage percentage
     coverage = None
+
     for line in output.split("\n"):
-        if "All files" in line or "SearchBar" in line:
+        if "All files" in line or "%" in line:
             parts = line.split("|")
             if len(parts) > 1:
                 try:
-                    coverage = float(parts[1].strip())
+                    coverage = float(parts[1].strip().rstrip("%"))
+                    break
                 except ValueError:
                     pass
 
@@ -100,40 +105,61 @@ def get_coverage(module_path: str) -> dict:
 
 
 def generate_tests(task: dict, file_contents: dict) -> str:
+    framework = _detect_framework(file_contents)
+
     files_context = ""
     for filepath, content in file_contents.items():
         files_context += f"\n\n--- FILE: {filepath} ---\n{content}"
 
-    criteria = "\n".join(
-        f"- {c}" for c in task.get("acceptance_criteria", [])
-    )
+    criteria = "\n".join(f"- {c}" for c in task.get("acceptance_criteria", []))
 
-    prompt = f"""You are an expert React and TypeScript test engineer.
+    if framework == "react":
+        role = "an expert React and TypeScript test engineer"
+        instructions = """\
+1. Use Jest and React Testing Library
+2. Use @testing-library/jest-dom matchers
+3. Mock external dependencies and API calls
+4. Return a raw TypeScript test file ready to save as .test.tsx"""
+    elif framework == "jest":
+        role = "an expert TypeScript/JavaScript test engineer"
+        instructions = """\
+1. Use Jest for all tests
+2. Mock external dependencies and modules
+3. Return a raw TypeScript test file ready to save as .test.ts"""
+    elif framework == "pytest":
+        role = "an expert Python test engineer"
+        instructions = """\
+1. Use pytest for all tests
+2. Use fixtures for shared setup
+3. Return a raw Python test file ready to save as test_*.py"""
+    else:
+        role = "an expert software test engineer"
+        instructions = """\
+1. Write tests appropriate for the language and framework in the provided code
+2. Mock external dependencies
+3. Return only the raw test file content"""
 
-Your job is to write comprehensive Jest and React Testing Library tests
-for the following task.
+    prompt = f"""You are {role}.
+
+Write comprehensive tests for the following task.
 
 ## Task
-Title: {task['title']}
+{task['title']}
 
 ## Acceptance Criteria
 {criteria}
 
-## Updated Code
+## Code to Test
 {files_context}
 
 ## Instructions
-1. Write tests for ALL acceptance criteria
-2. Write tests for edge cases too
-3. Use React Testing Library best practices
-4. Use @testing-library/jest-dom matchers
-5. Mock any external dependencies
-6. Each test must have a clear descriptive name
-7. Group related tests inside describe blocks
+{instructions}
+5. Write a test for every acceptance criterion
+6. Cover key edge cases
+7. Give each test a clear descriptive name
+8. Group related tests in describe blocks
 
-Return ONLY the raw TypeScript test file content.
-No explanation, no markdown fences, just the code.
-The file should be ready to save and run immediately."""
+Return ONLY the raw test file content — no explanation, no markdown fences."""
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
@@ -143,7 +169,6 @@ The file should be ready to save and run immediately."""
 
     raw = response.content[0].text.strip()
 
-    # Strip markdown fences if Claude added them
     if raw.startswith("```"):
         lines = raw.split("\n")
         raw = "\n".join(lines[1:-1])
@@ -151,51 +176,34 @@ The file should be ready to save and run immediately."""
     return raw
 
 
-# Quick test
 if __name__ == "__main__":
-    from rich import print
+    import argparse
     from agent.tools.task_reader import get_task, parse_task
-    from agent.tools.code_scanner import read_file, search_code
+    from agent.tools.code_scanner import read_file
+    from rich import print
 
-    repo_path = os.getenv("REPO_LOCAL_PATH", ".")
+    parser = argparse.ArgumentParser(description="Generate and run tests for a GitHub issue")
+    parser.add_argument("--issue", type=int, required=True, help="GitHub issue number")
+    parser.add_argument("--file", required=True, help="Implementation file to write tests for")
+    args = parser.parse_args()
 
-    print("\n[bold]Step 1: Loading task #18...[/bold]")
-    raw = get_task(18)
+    raw = get_task(args.issue)
     task = parse_task(raw)
     print(f"Task: {task['title']}")
 
-    print("\n[bold]Step 2: Finding SearchBar.tsx...[/bold]")
-    results = search_code("SearchBar", repo_path)
-    target_file = None
-    for r in results:
-        if "SearchBar.tsx" in r["filepath"] and "test" not in r["filepath"]:
-            target_file = r["filepath"]
-            break
+    file_data = read_file(args.file)
+    if not file_data["success"]:
+        print(f"[red]File not found: {args.file}[/red]")
+        raise SystemExit(1)
 
-    if not target_file:
-        print("[red]SearchBar.tsx not found![/red]")
-        exit()
+    test_content = generate_tests(task, {args.file: file_data["content"]})
 
-    print(f"Found: {target_file}")
-
-    print("\n[bold]Step 3: Reading updated file...[/bold]")
-    file_data = read_file(target_file)
-    print(f"Lines: {file_data['line_count']}")
-
-    print("\n[bold]Step 4: Asking Claude to write tests...[/bold]")
-    test_content = generate_tests(
-        task,
-        {target_file: file_data["content"]}
-    )
-
-    # Save test file next to the component
-    test_filepath = target_file.replace(".tsx", ".test.tsx")
-    print(f"\n[bold]Step 5: Saving test file to:[/bold] {test_filepath}")
+    ext = os.path.splitext(args.file)[1]
+    test_filepath = args.file.replace(ext, f".test{ext}")
     result = write_test_file(test_filepath, test_content)
     print(result)
 
-    print("\n[bold]Step 6: Running tests...[/bold]")
     test_result = run_tests(test_filepath)
-    print(f"Passed : {test_result['passed_count']}")
-    print(f"Failed : {test_result['failed_count']}")
-    print(f"Output :\n{test_result['output'][:500]}")
+    print(f"Passed: {test_result['passed_count']}  Failed: {test_result['failed_count']}")
+    if not test_result["success"]:
+        print(test_result["output"][:500])

@@ -1,12 +1,12 @@
 import os
 import subprocess
-import anthropic
 from github import Github, Auth
 from dotenv import load_dotenv
+from agent.utils.retry import RetryingClient, with_github_retry
 
 load_dotenv("config/.env")
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 
 def get_repo():
@@ -116,38 +116,58 @@ Be concise and professional. Use markdown formatting."""
         }]
     )
 
-    return response.content[0].text.strip()
+    msg = response.content[0].text.strip()
+    closes = f"Closes #{task['number']}"
+    if closes not in msg:
+        msg = f"{msg}\n\n{closes}"
+    return msg
+
+
+def _assign_reviewers(pr, config: dict) -> list[str]:
+    """Request reviewers on a PR. Returns list of warnings (non-fatal)."""
+    rev_cfg = (config or {}).get("reviewers", {})
+    users = [u for u in rev_cfg.get("users", []) if u]
+    teams = [t for t in rev_cfg.get("teams", []) if t]
+    if not users and not teams:
+        return []
+    warnings = []
+    try:
+        with_github_retry(pr.create_review_request, reviewers=users, team_reviewers=teams)
+    except Exception as exc:
+        warnings.append(f"Reviewer assignment failed: {exc}")
+    return warnings
 
 
 def create_pull_request(
     task: dict,
     branch_name: str,
     base_branch: str,
-    changes: list
+    changes: list,
+    config: dict = None,
 ) -> dict:
     try:
         repo = get_repo()
 
-        # Generate PR title
         pr_title = f"[Issue #{task['number']}] {task['title']}"
-
-        # Generate PR description
         pr_body = generate_pr_description(task, changes)
 
-        # Create the PR
-        pr = repo.create_pull(
+        pr = with_github_retry(
+            repo.create_pull,
             title=pr_title,
             body=pr_body,
             head=branch_name,
-            base=base_branch
+            base=base_branch,
         )
+
+        reviewer_warnings = _assign_reviewers(pr, config)
 
         return {
             "success": True,
             "pr_number": pr.number,
             "pr_url": pr.html_url,
             "title": pr_title,
-            "message": f"PR #{pr.number} created successfully"
+            "message": f"PR #{pr.number} created successfully",
+            "reviewer_warnings": reviewer_warnings,
         }
 
     except Exception as e:
@@ -183,57 +203,33 @@ Return only the commit message, nothing else."""
         }]
     )
 
-    return response.content[0].text.strip()
+    msg = response.content[0].text.strip()
+    closes = f"Closes #{task['number']}"
+    if closes not in msg:
+        msg = f"{msg}\n\n{closes}"
+    return msg
 
 
-# Quick test
 if __name__ == "__main__":
-    from rich import print
+    import argparse
     from agent.tools.task_reader import get_task, parse_task
+    from rich import print
 
-    print("\n[bold]Step 1: Loading task #18...[/bold]")
-    raw = get_task(18)
+    parser = argparse.ArgumentParser(description="Generate a commit message and create a PR for an issue")
+    parser.add_argument("--issue", type=int, required=True, help="GitHub issue number")
+    parser.add_argument("--branch", required=True, help="Feature branch name")
+    parser.add_argument("--base", default="main", help="Base branch (default: main)")
+    args = parser.parse_args()
+
+    raw = get_task(args.issue)
     task = parse_task(raw)
     print(f"Task: {task['title']}")
 
-    changes = [
-        "Added result count Typography label above search results list",
-        "Label shows '{count} results for {query}' when results exist",
-        "Label only renders when results.length > 0 and query is non-empty",
-        "Added SearchBar.test.tsx with full test coverage",
-        "Updated README with recent changes"
-    ]
+    commit_msg = generate_commit_message(task, [f"Implemented: {task['title']}"])
+    print(f"\nCommit message:\n{commit_msg}")
 
-    print("\n[bold]Step 2: Generating commit message...[/bold]")
-    commit_msg = generate_commit_message(task, changes)
-    print(commit_msg)
-
-    print("\n[bold]Step 3: Committing files...[/bold]")
-    repo_path = os.getenv("REPO_LOCAL_PATH", ".")
-    result = git_commit(
-        "issue-18",
-        [
-            os.path.join(repo_path, "src", "components", "SearchBar.tsx"),
-            os.path.join(repo_path, "src", "components", "SearchBar.test.tsx"),
-            os.path.join(repo_path, "README.md")
-        ],
-        commit_msg
-    )
-    print(result)
-
-    print("\n[bold]Step 4: Pushing branch...[/bold]")
-    push_result = push_branch("issue-18")
-    print(push_result)
-
-    print("\n[bold]Step 5: Creating Pull Request...[/bold]")
-    pr_result = create_pull_request(
-        task,
-        "issue-18",
-        "main",
-        changes
-    )
-    print(pr_result)
-
+    pr_result = create_pull_request(task, args.branch, args.base, [task["title"]])
     if pr_result["success"]:
-        print(f"\n[bold green]🎉 PR created![/bold green]")
-        print(f"[bold]URL:[/bold] {pr_result['pr_url']}")
+        print(f"\nPR created: {pr_result['pr_url']}")
+    else:
+        print(f"\n[red]PR failed: {pr_result['error']}[/red]")

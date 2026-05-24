@@ -1,6 +1,7 @@
 import os
 from github import Github, Auth
 from dotenv import load_dotenv
+from agent.utils.retry import with_github_retry
 
 load_dotenv("config/.env")
 
@@ -8,7 +9,7 @@ load_dotenv("config/.env")
 def get_repo():
     auth = Auth.Token(os.getenv("GITHUB_TOKEN"))
     g = Github(auth=auth)
-    return g.get_repo(os.getenv("GITHUB_REPO"))
+    return with_github_retry(g.get_repo, os.getenv("GITHUB_REPO"))
 
 
 def validate_base(base_branch: str = "main") -> dict:
@@ -47,9 +48,10 @@ def create_branch(issue_number: int, base_branch: str = "main") -> dict:
     sha = base.commit.sha
 
     # Create the new branch
-    repo.create_git_ref(
+    with_github_retry(
+        repo.create_git_ref,
         ref=f"refs/heads/{branch_name}",
-        sha=sha
+        sha=sha,
     )
 
     return {
@@ -83,14 +85,18 @@ def checkout(branch_name: str) -> dict:
     }
 
 
-# Quick test
 if __name__ == "__main__":
+    import argparse
     from rich import print
 
-    print("\n[bold]Step 1: Validating base branch...[/bold]")
-    result = validate_base("main")
-    print(result)
+    parser = argparse.ArgumentParser(description="Create a branch for a GitHub issue")
+    parser.add_argument("--issue", type=int, required=True, help="GitHub issue number")
+    parser.add_argument("--base", default="main", help="Base branch (default: main)")
+    args = parser.parse_args()
 
-    print("\n[bold]Step 2: Creating branch for issue #18...[/bold]")
-    result = create_branch(18, "main")
-    print(result)
+    validation = validate_base(args.base)
+    print(validation)
+
+    if validation["valid"]:
+        result = create_branch(args.issue, args.base)
+        print(result)

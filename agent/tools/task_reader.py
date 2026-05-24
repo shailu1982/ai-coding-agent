@@ -1,14 +1,15 @@
 import os
 from github import Github, Auth
 from dotenv import load_dotenv
+from agent.utils.retry import with_github_retry
 
 load_dotenv("config/.env")
 
 def get_task(issue_number: int) -> dict:
     auth = Auth.Token(os.getenv("GITHUB_TOKEN"))
     g = Github(auth=auth)
-    repo = g.get_repo(os.getenv("GITHUB_REPO"))
-    issue = repo.get_issue(number=issue_number)
+    repo = with_github_retry(g.get_repo, os.getenv("GITHUB_REPO"))
+    issue = with_github_retry(repo.get_issue, number=issue_number)
 
     return {
         "number": issue.number,
@@ -58,20 +59,18 @@ def get_criteria(task: dict) -> list:
     return task.get("acceptance_criteria") or []
 
 
-# Quick test
 if __name__ == "__main__":
+    import argparse
     from rich import print
 
-    print("\n[bold]Fetching issue #18...[/bold]")
-    raw = get_task(18)
-    print("\n[bold]Raw task:[/bold]")
-    print(raw)
+    parser = argparse.ArgumentParser(description="Fetch and parse a GitHub issue")
+    parser.add_argument("--issue", type=int, required=True, help="GitHub issue number")
+    args = parser.parse_args()
 
+    raw = get_task(args.issue)
     parsed = parse_task(raw)
-    print("\n[bold]Parsed task:[/bold]")
     print(parsed)
 
     criteria = get_criteria(parsed)
-    print("\n[bold]Acceptance criteria:[/bold]")
     for i, c in enumerate(criteria, 1):
         print(f"  {i}. {c}")

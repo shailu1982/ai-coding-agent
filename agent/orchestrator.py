@@ -1,26 +1,45 @@
 import os
+import json
 import argparse
-import anthropic
 from dotenv import load_dotenv
 from rich import print
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from agent.utils.retry import RetryingClient
+from agent.utils.config import load_repo_config
 
 load_dotenv("config/.env")
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = RetryingClient(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Import all tools
-from agent.tools.task_reader import get_task, parse_task, get_criteria
+from agent.tools.task_reader import get_task, parse_task
 from agent.tools.branch_manager import validate_base, create_branch
-from agent.tools.code_scanner import get_file_tree, list_files, read_file, search_code
-from agent.tools.implementer import implement_task, apply_implementation, run_linter
+from agent.tools.code_scanner import get_file_tree, read_file
+from agent.tools.implementer import implement_task, apply_changes, run_linter
 from agent.tools.test_writer import generate_tests, write_test_file, run_tests
+from agent.tools.healer import fix_failing_tests, is_runner_error
+from agent.tools.regression_guard import capture_baseline, check_regressions
+from agent.tools.type_checker import run_type_check
 from agent.tools.reviewer import security_scan, optimize_code, check_seo, update_readme
 from agent.tools.pr_creator import generate_commit_message, git_commit, push_branch, create_pull_request
+from agent.utils.examples import find_examples, save_example
 
 
-def find_relevant_files(task: dict, repo_path: str) -> dict:
+def _primary_file(filepaths: list) -> str:
+    """Return the best file to anchor test generation — avoids barrel/type files."""
+    secondary = ("index.", "types.", "constants.", "interfaces.", "exports.")
+    for f in filepaths:
+        if not any(os.path.basename(f).lower().startswith(p) for p in secondary):
+            return f
+    return filepaths[0]
+
+
+def _resolve(filepath: str, repo_path: str) -> str:
+    if os.path.isabs(filepath):
+        return filepath
+    return os.path.join(repo_path, filepath.lstrip("/").lstrip("\\"))
+
+
+def find_relevant_files(task: dict, repo_path: str, max_files: int = 5) -> dict:
     """Ask Claude to identify which files are relevant to the task."""
 
     tree = get_file_tree(repo_path)
@@ -40,17 +59,15 @@ Description: {task['description']}
 ## File Tree
 {tree}
 
-Return ONLY a JSON array of the most relevant file paths (max 5 files).
+Return ONLY a JSON array of the most relevant file paths (max {max_files} files).
 Pick files most likely to need changes or provide context.
-Example: ["src/components/SearchBar.tsx", "src/hooks/useSearch.ts"]
+Example: ["src/components/MyComponent.tsx", "src/utils/helpers.ts"]
 Return only the JSON array, nothing else."""
         }]
     )
 
     raw = response.content[0].text.strip()
 
-    # Parse file paths from response
-    import json
     try:
         if raw.startswith("```"):
             lines = raw.split("\n")
@@ -75,9 +92,12 @@ Return only the JSON array, nothing else."""
     return file_contents
 
 
-def run_agent(issue_number: int):
+def run_agent(issue_number: int) -> str:
+    """Run the full pipeline for a GitHub issue. Returns the PR URL on success."""
     repo_path = os.getenv("REPO_LOCAL_PATH", ".")
-    base_branch = os.getenv("BASE_BRANCH", "main")
+    config = load_repo_config(repo_path)
+
+    base_branch = config["base_branch"]
     branch_name = f"issue-{issue_number}"
 
     print(Panel(
@@ -104,92 +124,199 @@ def run_agent(issue_number: int):
     print("\n[bold cyan]━━ Stage 2: Creating branch...[/bold cyan]")
     validation = validate_base(base_branch)
     if not validation["valid"]:
-        print(f"  [red]❌ Base branch error: {validation['message']}[/red]")
-        return
+        raise RuntimeError(f"Base branch error: {validation['message']}")
 
     branch_result = create_branch(issue_number, base_branch)
+    if not branch_result.get("success"):
+        raise RuntimeError(f"Branch creation failed: {branch_result.get('message')}")
     print(f"  ✅ {branch_result['message']}")
 
     # ─────────────────────────────────────────
-    # STAGE 3: Scan the codebase
+    # STAGE 3: Scan the codebase + capture baseline
     # ─────────────────────────────────────────
     print("\n[bold cyan]━━ Stage 3: Scanning codebase...[/bold cyan]")
-    file_contents = find_relevant_files(task, repo_path)
+    file_contents = find_relevant_files(task, repo_path, max_files=config["max_relevant_files"])
     print(f"  ✅ Found {len(file_contents)} relevant files:")
     for path in file_contents:
         print(f"     • {path}")
 
     if not file_contents:
-        print("  [red]❌ No relevant files found[/red]")
-        return
+        raise RuntimeError("No relevant files found in codebase")
+
+    # Capture test baseline before touching any files
+    guard_enabled = config["regression_guard"]
+    if guard_enabled:
+        baseline = capture_baseline(repo_path, config)
+        if baseline.get("skipped"):
+            print(f"  ℹ️  Baseline : skipped ({baseline['output'][:80]})")
+        else:
+            print(f"  ✅ Baseline : {baseline['passed']} passed, {baseline['failed']} failed ({baseline['runner']})")
 
     # ─────────────────────────────────────────
-    # STAGE 4: Implement the task
+    # STAGE 4: Implement the task (multi-file)
     # ─────────────────────────────────────────
     print("\n[bold cyan]━━ Stage 4: Implementing task...[/bold cyan]")
-    impl = implement_task(task, file_contents)
+    examples = find_examples(task)
+    if examples:
+        print(f"  ✅ Examples : {len(examples)} similar past task(s) loaded as few-shot context")
+    impl = implement_task(task, file_contents, examples=examples)
 
     if not impl["success"]:
-        print(f"  [red]❌ Implementation failed[/red]")
-        return
+        raise RuntimeError(f"Implementation step failed: {impl.get('explanation')}")
 
-    print(f"  ✅ File    : {impl['filepath']}")
-    print(f"  ✅ Type    : {impl['change_type']}")
-    print(f"  ✅ Plan    : {impl['explanation']}")
+    print(f"  ✅ Changes  : {len(impl['changes'])} file(s) planned")
 
-    apply_result = apply_implementation(impl)
-    if apply_result["success"]:
-        print(f"  ✅ Applied : {apply_result['message']}")
-    else:
-        print(f"  [red]❌ Apply failed: {apply_result.get('error')}[/red]")
-        return
+    apply_results = apply_changes(impl["changes"])
 
-    # Track changed files for commit
     changed_files = []
-    if impl["filepath"]:
-        full_impl_path = os.path.join(
-            repo_path, impl["filepath"].lstrip("/")
-        )
-        if os.path.isabs(impl["filepath"]):
-            full_impl_path = impl["filepath"]
-        changed_files.append(full_impl_path)
+    failed_paths = []
+
+    for change, result in zip(impl["changes"], apply_results):
+        icon = "✅" if result["success"] else "✗"
+        label = change["change_type"].upper()
+        detail = result.get("message") or result.get("error", "")
+        print(f"  {icon} [{label}] {change['filepath']} — {detail}")
+
+        if result["success"]:
+            changed_files.append(_resolve(change["filepath"], repo_path))
+        else:
+            failed_paths.append(change["filepath"])
+
+    if not changed_files:
+        raise RuntimeError(f"All {len(impl['changes'])} change(s) failed to apply")
+
+    if failed_paths:
+        print(f"  [yellow]⚠️  {len(failed_paths)} change(s) failed — continuing with {len(changed_files)} succeeded[/yellow]")
+
+    # Linter on every successfully changed file (non-blocking)
+    for path in changed_files:
+        lint = run_linter(path)
+        if lint.get("output"):
+            print(f"  ⚠️  Linter  : {os.path.basename(path)}: {lint['output'][:100]}")
 
     # ─────────────────────────────────────────
-    # STAGE 5: Write tests
+    # STAGE 4b: Type checking
+    # ─────────────────────────────────────────
+    print("\n[bold cyan]━━ Stage 4b: Type checking...[/bold cyan]")
+    tc = run_type_check(repo_path, config)
+    if tc["skipped"]:
+        print(f"  ℹ️  Skipped  : {tc['output'][:80]}")
+    elif tc["success"]:
+        print(f"  ✅ {tc['checker']}    : no type errors")
+    else:
+        snippet = tc["output"][-600:].strip()
+        print(f"  [yellow]⚠️  {tc['checker']}    : {tc['errors']} error(s)[/yellow]")
+        print(f"  [dim]{snippet[:300]}[/dim]")
+        if config.get("type_check", {}).get("blocking", False):
+            raise RuntimeError(
+                f"Type check failed ({tc['errors']} error(s) in {tc['checker']}).\n\n{snippet}"
+            )
+
+    # ─────────────────────────────────────────
+    # STAGE 5: Write tests + self-healing loop
     # ─────────────────────────────────────────
     print("\n[bold cyan]━━ Stage 5: Writing tests...[/bold cyan]")
-    impl_filepath = changed_files[0] if changed_files else None
+    impl_filepath = _primary_file(changed_files)
+    max_heal = config["max_heal_attempts"]
 
-    if impl_filepath:
-        file_data = read_file(impl_filepath)
-        test_content = generate_tests(
-            task,
-            {impl_filepath: file_data["content"]}
-        )
+    # Build context from all changed files so tests understand the full picture
+    file_context = {}
+    for path in changed_files:
+        data = read_file(path)
+        if data["success"]:
+            file_context[path] = data["content"]
 
-        # Save test file next to the component
-        ext = os.path.splitext(impl_filepath)[1]
-        test_filepath = impl_filepath.replace(ext, f".test{ext}")
-        test_result = write_test_file(test_filepath, test_content)
+    if not file_context:
+        print(f"  [yellow]⚠️  Could not read any changed files — skipping tests[/yellow]")
+    else:
+        test_content = generate_tests(task, file_context)
+        base, ext = os.path.splitext(impl_filepath)
+        test_filepath = f"{base}.test{ext}"
+        write_result = write_test_file(test_filepath, test_content)
 
-        if test_result["success"]:
-            print(f"  ✅ Tests written: {test_filepath}")
-            changed_files.append(test_filepath)
+        if not write_result["success"]:
+            print(f"  [yellow]⚠️  Test write failed: {write_result.get('error')}[/yellow]")
         else:
-            print(f"  [yellow]⚠️  Test write failed: {test_result.get('error')}[/yellow]")
+            print(f"  ✅ Tests    : {os.path.basename(test_filepath)}")
+            changed_files.append(test_filepath)
+
+            # Run tests and heal if they fail
+            run_result = run_tests(test_filepath)
+
+            if run_result["success"]:
+                print(f"  ✅ Passed   : {run_result['passed_count']} test(s)")
+
+            elif is_runner_error(run_result["output"]):
+                print(f"  [yellow]⚠️  Test runner unavailable — skipping[/yellow]")
+
+            else:
+                print(f"  [yellow]⚠️  {run_result['failed_count']} test(s) failing — starting heal loop[/yellow]")
+
+                healed = False
+                for attempt in range(1, max_heal + 1):
+                    print(f"\n  [bold]Heal attempt {attempt}/{max_heal}[/bold]")
+
+                    heal = fix_failing_tests(
+                        impl_filepath, test_filepath, run_result["output"], attempt
+                    )
+
+                    if not heal["success"]:
+                        print(f"  [red]✗ Healer error: {heal.get('error')}[/red]")
+                        break
+
+                    target = os.path.basename(heal["filepath"])
+                    print(f"  → Fixed {heal['fix_target']} ({target}): {heal['explanation']}")
+
+                    run_result = run_tests(test_filepath)
+
+                    if run_result["success"]:
+                        print(f"  ✅ Healed   : {run_result['passed_count']} test(s) now passing")
+                        healed = True
+                        break
+                    else:
+                        print(f"  [yellow]  Still {run_result['failed_count']} failing[/yellow]")
+
+                if not healed:
+                    print(f"\n  [yellow]⚠️  Tests still failing after {max_heal} attempt(s) — continuing[/yellow]")
 
     # ─────────────────────────────────────────
-    # STAGE 6: Review
+    # STAGE 6: Regression guard
     # ─────────────────────────────────────────
-    print("\n[bold cyan]━━ Stage 6: Reviewing...[/bold cyan]")
+    print("\n[bold cyan]━━ Stage 6: Regression guard...[/bold cyan]")
+    if guard_enabled:
+        reg = check_regressions(repo_path, baseline, config)
+        if reg.get("skipped"):
+            print(f"  ℹ️  Skipped  : {reg.get('snippet', 'no runner available')[:80]}")
+        elif reg["regressions"] == 0:
+            delta = reg["after_passed"] - reg["baseline_passed"]
+            delta_str = f"+{delta}" if delta >= 0 else str(delta)
+            print(f"  ✅ Clean    : {reg['after_failed']} failing (baseline {reg['baseline_failed']}), {delta_str} passing")
+        else:
+            snippet = reg["snippet"]
+            raise RuntimeError(
+                f"Regression detected: {reg['regressions']} new test failure(s) introduced "
+                f"({reg['baseline_failed']} → {reg['after_failed']} failing).\n\n{snippet}"
+            )
+    else:
+        print(f"  ℹ️  Skipped  : REGRESSION_GUARD=false")
 
-    if impl_filepath:
-        # Security
+    # ─────────────────────────────────────────
+    # STAGE 7: Review
+    # ─────────────────────────────────────────
+    print("\n[bold cyan]━━ Stage 7: Reviewing...[/bold cyan]")
+    review_cfg = config.get("review", {})
+
+    # Security
+    if review_cfg.get("security", True):
         sec = security_scan(impl_filepath)
-        sec_issues = "no issues" if "no" in sec["output"].lower() else "issues found"
-        print(f"  ✅ Security : {sec_issues}")
+        output_lower = sec.get("output", "").lower()
+        sec_status = "clean" if "issues_found: no" in output_lower or "no issues" in output_lower else "issues found — review output"
+        print(f"  ✅ Security : {sec_status}")
+    else:
+        print(f"  ℹ️  Security : skipped (config)")
 
-        # Optimisation
+    # Optimisation
+    if review_cfg.get("optimize", True):
         opt = optimize_code(impl_filepath)
         if opt.get("updated_code"):
             with open(impl_filepath, "w", encoding="utf-8") as f:
@@ -197,40 +324,49 @@ def run_agent(issue_number: int):
             print(f"  ✅ Optimised: code updated")
         else:
             print(f"  ✅ Optimised: no changes needed")
+    else:
+        print(f"  ℹ️  Optimise : skipped (config)")
 
-        # SEO
+    # SEO / accessibility (only applies to UI files)
+    if review_cfg.get("seo", True):
         seo = check_seo(impl_filepath)
-        print(f"  ✅ SEO      : {len(seo.get('issues', []))} issues found")
+        seo_issues = seo.get("issues", [])
+        seo_msg = f"{len(seo_issues)} issue(s) found" if seo_issues else "clean"
+        print(f"  ✅ SEO/a11y : {seo_msg}")
+    else:
+        print(f"  ℹ️  SEO/a11y : skipped (config)")
 
     # README
-    readme_result = update_readme(repo_path, impl["explanation"])
-    if readme_result["success"]:
-        print(f"  ✅ README   : updated")
-        readme_path = os.path.join(repo_path, "README.md")
-        if readme_path not in changed_files:
-            changed_files.append(readme_path)
+    if review_cfg.get("readme", True):
+        readme_result = update_readme(repo_path, impl["explanation"])
+        if readme_result["success"]:
+            print(f"  ✅ README   : updated")
+            readme_path = os.path.join(repo_path, "README.md")
+            if readme_path not in changed_files:
+                changed_files.append(readme_path)
+    else:
+        print(f"  ℹ️  README   : skipped (config)")
 
     # ─────────────────────────────────────────
-    # STAGE 7: Commit, push and raise PR
+    # STAGE 8: Commit, push and raise PR
     # ─────────────────────────────────────────
-    print("\n[bold cyan]━━ Stage 7: Creating PR...[/bold cyan]")
+    print("\n[bold cyan]━━ Stage 8: Creating PR...[/bold cyan]")
 
-    changes_summary = [
-        impl["explanation"],
-        f"Added test file for {os.path.basename(impl_filepath or '')}",
-        "Updated README with recent changes"
-    ]
+    test_files = [f for f in changed_files if ".test." in os.path.basename(f)]
+    changes_summary = [c["explanation"] for c in impl["changes"] if c.get("explanation")]
+    if test_files:
+        changes_summary.append(f"Added tests for {os.path.basename(impl_filepath)}")
+    changes_summary.append("Updated README")
 
     commit_msg = generate_commit_message(task, changes_summary)
-    print(f"  ✅ Commit message generated")
+    print(f"  ✅ Commit   : message generated")
 
     commit_result = git_commit(branch_name, changed_files, commit_msg)
     print(f"  ✅ Committed: {commit_result['message'][:60]}")
 
     push_result = push_branch(branch_name)
     if not push_result["success"]:
-        print(f"  [red]❌ Push failed: {push_result['error']}[/red]")
-        return
+        raise RuntimeError(f"Push failed: {push_result['error']}")
 
     print(f"  ✅ Pushed   : branch {branch_name}")
 
@@ -238,14 +374,23 @@ def run_agent(issue_number: int):
         task,
         branch_name,
         base_branch,
-        changes_summary
+        changes_summary,
+        config=config,
     )
 
-    if pr_result["success"]:
-        print(f"  ✅ PR #{pr_result['pr_number']} created")
-    else:
-        print(f"  [red]❌ PR failed: {pr_result['error']}[/red]")
-        return
+    if not pr_result["success"]:
+        raise RuntimeError(f"PR creation failed: {pr_result['error']}")
+
+    print(f"  ✅ PR #{pr_result['pr_number']} created")
+
+    for warn in pr_result.get("reviewer_warnings", []):
+        print(f"  [yellow]⚠️  {warn}[/yellow]")
+
+    try:
+        save_example(task, impl["changes"], pr_result["pr_url"])
+        print(f"  ✅ Saved    : implementation added to examples store")
+    except Exception as ex_err:
+        print(f"  [yellow]⚠️  Examples store: {ex_err}[/yellow]")
 
     # ─────────────────────────────────────────
     # DONE
@@ -257,6 +402,8 @@ def run_agent(issue_number: int):
         f"PR     : {pr_result['pr_url']}",
         expand=False
     ))
+
+    return pr_result["pr_url"]
 
 
 if __name__ == "__main__":
