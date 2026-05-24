@@ -1,0 +1,4 @@
+anthropic==0.104.1
+PyGithub==2.9.1
+python-dotenv==1.2.2
+rich==15.0.0
